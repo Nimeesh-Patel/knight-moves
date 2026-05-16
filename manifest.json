@@ -1,0 +1,29 @@
+{
+  "manifest_version": 3,
+
+  "name": "Knight Move Visualizer",
+  "version": "1.0",
+  "description": "Click a knight on chess.com to highlight reachable squares.",
+
+  "permissions": [
+    "storage"
+  ],
+
+  "host_permissions": [
+    "https://www.chess.com/*"
+  ],
+
+  "content_scripts": [
+    {
+      "matches": ["https://www.chess.com/*"],
+      "js": ["content.js"],
+      "css": ["styles.css"],
+      "run_at": "document_idle"
+    }
+  ],
+
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Knight Moves"
+  }
+}

@@ -1,0 +1,64 @@
+/*
+  styles.css
+  ----------
+  This file is injected directly into chess.com pages by the browser
+  (declared in manifest.json → content_scripts → css).
+
+  We only define styles for our overlay elements.
+  We do NOT touch any existing chess.com classes.
+*/
+
+/*
+  The overlay container sits on top of the board at a fixed position.
+  It is sized and positioned dynamically by content.js using
+  getBoundingClientRect() so it exactly covers the board.
+
+  pointer-events: none  — critical! without this, our div would block
+                          all mouse clicks on the board, breaking the game.
+  z-index: 9999         — places us above chess.com's piece layer.
+*/
+.km-overlay-container {
+  position: fixed;
+  pointer-events: none;
+  z-index: 9999;
+  /* left / top / width / height are set by content.js */
+}
+
+/*
+  Each .km-circle div represents one reachable square.
+  It occupies the full area of that square (12.5% of the board = 1/8).
+  The visible dot is drawn by the ::after pseudo-element so we can
+  centre it independently of the div's size.
+*/
+.km-circle {
+  position: absolute;
+  width: 12.5%;
+  height: 12.5%;
+  box-sizing: border-box;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  /* left / top are set by content.js based on col/row + board orientation */
+}
+
+/*
+  The actual visible circle dot inside each square.
+  Using ::after lets us keep the positioning div at full square size
+  while rendering a smaller centred circle — same technique chess.com
+  uses for its own legal-move dots.
+*/
+.km-circle::after {
+  content: '';
+  width: 38%;
+  height: 38%;
+  border-radius: 50%;
+  background: rgba(0, 180, 0, 0.55);  /* semi-transparent green */
+}
+
+/*
+  When the popup is in "exactly N" mode we add this class.
+  Blue distinguishes "exact depth" from "within depth" visually.
+*/
+.km-circle.km-exact::after {
+  background: rgba(30, 120, 220, 0.55);  /* semi-transparent blue */
+}

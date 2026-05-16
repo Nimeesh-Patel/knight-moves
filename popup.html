@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Knight Move Visualizer</title>
+  <!--
+    IMPORTANT — Manifest V3 Content Security Policy:
+    You cannot put JavaScript directly inside <script>...</script> tags here,
+    and you cannot use inline event handlers like onclick="...".
+    All JavaScript must live in a separate .js file (popup.js).
+    The browser will refuse to run inline scripts in MV3 extensions.
+  -->
+  <style>
+    /*
+      These styles only apply to the popup window itself.
+      styles.css is injected into chess.com pages, NOT into this popup.
+    */
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    body {
+      width: 230px;
+      padding: 14px;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      font-size: 14px;
+      color: #1a1a1a;
+      background: #fff;
+    }
+
+    h3 {
+      font-size: 15px;
+      margin-bottom: 14px;
+      color: #333;
+      border-bottom: 1px solid #eee;
+      padding-bottom: 8px;
+    }
+
+    .row {
+      margin-bottom: 12px;
+    }
+
+    .row label {
+      display: block;
+      margin-bottom: 4px;
+      font-weight: 600;
+      color: #555;
+    }
+
+    /* Depth slider */
+    #depth-slider {
+      width: 100%;
+      cursor: pointer;
+    }
+
+    #depth-display {
+      display: inline-block;
+      min-width: 18px;
+      text-align: center;
+      font-weight: 700;
+      color: #1a6e1a;
+    }
+
+    /* Mode radio group */
+    .mode-group {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+
+    .mode-group label {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-weight: 400;
+      cursor: pointer;
+      color: #333;
+    }
+
+    .hint {
+      margin-top: 12px;
+      font-size: 11px;
+      color: #888;
+      line-height: 1.4;
+    }
+  </style>
+</head>
+<body>
+
+  <h3>Knight Move Visualizer</h3>
+
+  <!-- Depth selector -->
+  <div class="row">
+    <label>
+      Depth:&nbsp;<span id="depth-display">2</span>
+    </label>
+    <!--
+      range input: gives a slider from 1 to 4.
+      popup.js reads .value as a string, so it parseInt()s it.
+    -->
+    <input type="range" id="depth-slider" min="1" max="4" value="2" step="1">
+  </div>
+
+  <!-- Mode selector -->
+  <div class="row">
+    <label>Mode</label>
+    <div class="mode-group">
+      <!--
+        Two radio buttons sharing name="mode".
+        Only one can be checked at a time.
+        popup.js reads whichever is checked.
+      -->
+      <label>
+        <input type="radio" name="mode" value="within" checked>
+        Within N moves
+      </label>
+      <label>
+        <input type="radio" name="mode" value="exact">
+        Exactly N moves
+      </label>
+    </div>
+  </div>
+
+  <p class="hint">
+    Click a knight on chess.com to highlight squares.<br>
+    Click elsewhere to clear.
+  </p>
+
+  <!--
+    Script tag must be at the bottom of body (or use DOMContentLoaded).
+    src= points to our separate JS file — no inline scripts allowed in MV3.
+  -->
+  <script src="popup.js"></script>
+
+</body>
+</html>
