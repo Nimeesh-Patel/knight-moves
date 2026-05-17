@@ -1,239 +1,389 @@
 /*
   content.js
   ----------
-  This script is injected into every chess.com page by the browser
-  (declared in manifest.json → content_scripts).
-
-  It runs in an isolated JavaScript environment — it can read and
-  modify the page's DOM, but it cannot access chess.com's own JS
-  variables, and chess.com's JS cannot access ours.
-
-  Responsibilities:
-  1. Wait for the <chess-board> element to appear (handles both
-     immediate load and SPA navigation).
-  2. On click: detect which square was clicked and whether it holds
-     a knight.
-  3. Compute reachable squares via BFS.
-  4. Render transparent overlay circles on those squares.
-  5. Listen for settings changes from the popup.
+  Injected into every chess.com page. Detects the board, listens for
+  knight clicks, computes reachable squares via BFS, and renders
+  transparent overlay circles.
 
   ┌─────────────────────────────────────────────────────────────────┐
-  │  Extension Architecture (big picture)                           │
+  │  Extension Architecture                                         │
   │                                                                 │
   │  popup.html / popup.js                                          │
   │      │  chrome.tabs.sendMessage()                               │
   │      ▼                                                          │
   │  content.js  ◄──── chrome.runtime.onMessage                    │
   │      │                                                          │
-  │      ├── reads chess.com DOM (<chess-board>, .square-XY, .wN)  │
+  │      ├── reads chess.com DOM (<chess-board>, piece elements)    │
   │      └── writes overlay divs to document.body                  │
   │                                                                 │
-  │  chrome.storage.local: persists { depth, mode } across opens   │
+  │  chrome.storage.local: persists { depth, mode }                │
   └─────────────────────────────────────────────────────────────────┘
+
+  WHY THE ORIGINAL DETECTION FAILED
+  ──────────────────────────────────
+  The original code assumed:
+    1. Pieces are CHILDREN of square elements (.square-XY > .wN)
+    2. Knight classes are uppercase: .wN, .bN
+
+  Modern chess.com (React frontend, ~2023+) uses a FLAT DOM:
+    - Square <div>s and piece <div>s are SIBLINGS inside the board
+    - Knight classes are lowercase: .wn, .bn
+    - Piece elements carry their own square class (e.g. class="piece wn square-26")
+
+  So querySelector('.wN') inside a square element always returns null,
+  and the handler silently bailed out on every click.
+
+  FIX: detect the clicked PIECE element directly, then extract its
+  square from the piece element itself rather than from the DOM hierarchy.
 */
 
-// ── Global state ────────────────────────────────────────────────────
-/*
-  We keep a small state object rather than scattered globals so that
-  all mutable data is in one place and easy to reason about.
-*/
+// ── Debug flag ────────────────────────────────────────────────────────
+// Set to false to silence all [KM] console logs and visual outlines.
+const DEBUG = true;
+
+// ── Global state ─────────────────────────────────────────────────────
 const STATE = {
-  depth: 2,         // how many knight moves to compute (1–4)
-  mode: 'within',   // 'within' = up to depth, 'exact' = shortest-path = depth
-
-  boardEl: null,            // reference to the <chess-board> DOM element
-  overlayContainer: null,   // the single div we append to document.body for overlays
-  clickedSquare: null,      // { col, row } of the last clicked knight, or null
-
-  // We store references to the scroll/resize listeners so we can
-  // remove them when we clear overlays (avoid listener leaks)
+  depth: 2,
+  mode: 'within',    // 'within' | 'exact'
+  boardEl: null,
+  overlayContainer: null,
+  clickedSquare: null,
   _scrollListener: null,
   _resizeListener: null,
 };
 
-// ── Initialisation ──────────────────────────────────────────────────
-
+// ── Debug outline helpers ─────────────────────────────────────────────
 /*
-  Load saved settings from storage, then start watching for the board.
-  We load settings first so that the first click uses the right values.
+  We temporarily add a coloured CSS outline to elements so they are
+  visually identifiable in the page without DevTools element inspector.
+  References are stored so they can be restored before the next click.
+
+  Colours:
+    blue   → <chess-board> element (set once on detection)
+    red    → event.target (the element the user actually clicked)
+    orange → the piece element we detected
 */
+const _debugOutlines = [];  // { el, originalOutline }
+
+function setDebugOutline(el, color) {
+  if (!DEBUG || !el) return;
+  _debugOutlines.push({ el, originalOutline: el.style.outline });
+  el.style.outline = `3px solid ${color}`;
+}
+
+function clearDebugOutlines() {
+  if (!DEBUG) return;
+  for (const { el, originalOutline } of _debugOutlines) {
+    el.style.outline = originalOutline;
+  }
+  _debugOutlines.length = 0;
+}
+
+// ── DOM inspection helper ─────────────────────────────────────────────
+/*
+  inspectElement — logs a complete dump of one element and its ancestry.
+  Use this to discover chess.com's real class names and data attributes
+  when the extension isn't detecting correctly.
+
+  Output format:
+    [KM] <label>
+      tag:     DIV
+      class:   "piece wn square-26"
+      attrs:   data-piece="wn"
+      parents: DIV.board > chess-board
+*/
+function inspectElement(el, label) {
+  if (!DEBUG || !el) return;
+
+  const classes = el.className || '(none)';
+
+  // Collect all non-class attributes
+  const attrs = [...(el.attributes || [])]
+    .filter(a => a.name !== 'class')
+    .map(a => `${a.name}="${a.value}"`)
+    .join('  ') || '(none)';
+
+  // Build ancestor chain up to <chess-board>
+  const parents = [];
+  let node = el.parentElement;
+  while (node && node.tagName !== 'CHESS-BOARD') {
+    const cls = node.classList.length ? '.' + [...node.classList].join('.') : '';
+    parents.push(node.tagName + cls);
+    node = node.parentElement;
+  }
+  if (node) parents.push('chess-board');
+
+  console.log(
+    `[KM] ${label}\n` +
+    `  tag:     ${el.tagName}\n` +
+    `  class:   "${classes}"\n` +
+    `  attrs:   ${attrs}\n` +
+    `  parents: ${parents.join(' > ') || '(none)'}`
+  );
+}
+
+// ── Initialisation ────────────────────────────────────────────────────
+
 chrome.storage.local.get({ depth: 2, mode: 'within' }, (saved) => {
   STATE.depth = saved.depth;
   STATE.mode  = saved.mode;
   initBoardDetection();
 });
 
-/*
-  initBoardDetection — two-phase board detection
-  ───────────────────────────────────────────────
-  Phase 1: The board may already be in the DOM when this script runs
-           (e.g., hard-loading a game URL). Try to find it immediately.
-
-  Phase 2: Chess.com is a Single-Page Application (SPA). Navigating
-           between pages happens without a full page reload, so the
-           <chess-board> element is added to the DOM after our script
-           has already run. A MutationObserver fires whenever DOM nodes
-           are added/removed, so we use one to catch this.
-
-           We keep the observer PERMANENTLY ALIVE (never disconnect it)
-           so that if the user starts a new game — which removes and
-           re-adds <chess-board> — we re-attach our click listener to
-           the fresh element.
-*/
 function initBoardDetection() {
-  // Phase 1: immediate check
+  // Phase 1: board may already exist (hard page load)
   const existing = document.querySelector('chess-board');
-  if (existing) {
-    attachListeners(existing);
-  }
+  if (existing) attachListeners(existing);
 
-  // Phase 2: watch for future additions / replacements
+  // Phase 2: permanent observer — catches SPA navigation and board
+  //          being removed/re-added between games
   const observer = new MutationObserver(() => {
     const board = document.querySelector('chess-board');
     if (board && board !== STATE.boardEl) {
-      // A new (or replaced) <chess-board> appeared
       attachListeners(board);
     }
   });
-
-  observer.observe(document.body, {
-    childList: true,   // watch for direct children being added/removed
-    subtree: true,     // … at any depth in the tree
-  });
+  observer.observe(document.body, { childList: true, subtree: true });
 }
 
-/*
-  attachListeners — called once per <chess-board> element
-  ────────────────────────────────────────────────────────
-  We use EVENT DELEGATION: instead of attaching a listener to each
-  individual square, we attach one listener to the board element.
-  When any descendant is clicked, the event bubbles up to the board
-  and we inspect event.target to figure out which square was clicked.
-
-  This is more efficient (one listener instead of 64) and automatically
-  covers dynamically added squares.
-*/
 function attachListeners(boardEl) {
   STATE.boardEl = boardEl;
+  if (DEBUG) {
+    console.log('[KM] chess-board detected:', boardEl);
+    setDebugOutline(boardEl, 'blue');
+  }
   boardEl.addEventListener('click', onBoardClick);
 }
 
-// ── Click handling ───────────────────────────────────────────────────
+// ── Click handling ────────────────────────────────────────────────────
 
-/*
-  onBoardClick — entry point for all clicks on the board
-  ──────────────────────────────────────────────────────
-  Determines what was clicked and acts accordingly.
-*/
 function onBoardClick(event) {
-  // Find the square element (div with a class like "square-34")
-  const squareInfo = getSquareFromEl(event.target);
+  // Clear previous debug outlines before processing this click
+  clearDebugOutlines();
+  if (DEBUG) setDebugOutline(STATE.boardEl, 'blue');  // keep board outline
 
-  if (!squareInfo) {
-    // Clicked somewhere on the board that isn't a square (e.g., the border)
+  if (DEBUG) {
+    console.log(`[KM] click on: ${event.target.tagName} class="${event.target.className}"`);
+    inspectElement(event.target, 'click target');
+    setDebugOutline(event.target, 'red');
+  }
+
+  // Step 1: find the piece element in the click path
+  const pieceEl = detectClickedPiece(event.target);
+
+  if (!pieceEl) {
+    if (DEBUG) console.log('[KM] no piece element found in click path → clearing overlays');
     clearOverlays();
     STATE.clickedSquare = null;
     return;
   }
 
-  const { col, row, el: squareEl } = squareInfo;
+  if (DEBUG) {
+    inspectElement(pieceEl, 'detected piece');
+    setDebugOutline(pieceEl, 'orange');
+  }
 
-  // Check whether this square has a knight on it
-  if (!squareHasKnight(squareEl)) {
+  // Step 2: confirm it's a knight
+  const knight = isKnightPiece(pieceEl);
+  if (DEBUG) console.log(`[KM] is knight: ${knight}  (classes: "${pieceEl.className}")`);
+
+  if (!knight) {
     clearOverlays();
     STATE.clickedSquare = null;
     return;
   }
 
-  // We have a knight — compute and render
-  STATE.clickedSquare = { col, row };
-  const reachable = bfs(col, row, STATE.depth, STATE.mode);
+  // Step 3: extract board coordinates from the piece element
+  const square = extractSquare(pieceEl);
+
+  if (!square) {
+    if (DEBUG) {
+      console.log(
+        `[KM] could not extract square — piece classes: "${pieceEl.className}"` +
+        `  attrs: ${[...(pieceEl.attributes||[])].map(a=>`${a.name}="${a.value}"`).join(', ')}`
+      );
+    }
+    // Don't clear overlays — keep showing whatever was there
+    return;
+  }
+
+  if (DEBUG) console.log(`[KM] knight at col=${square.col} row=${square.row} — BFS depth=${STATE.depth} mode=${STATE.mode}`);
+
+  STATE.clickedSquare = square;
+  const reachable = bfs(square.col, square.row, STATE.depth, STATE.mode);
   clearOverlays();
   renderOverlays(reachable);
 }
 
+// ── Piece detection ───────────────────────────────────────────────────
+
 /*
-  getSquareFromEl — walk up the DOM from the clicked element to find
-                    the enclosing square div.
+  detectClickedPiece — walk up from the clicked element to find the
+  piece element. Returns the piece element or null.
 
-  Chess.com squares have a class like "square-34" where:
-    first digit  = column (file): 1=a … 8=h
-    second digit = row (rank):    1=rank 1 … 8=rank 8
-
-  We also handle the case where the piece element itself carries the
-  square class (chess.com sometimes puts it on both the square div
-  and the piece div).
-
-  Returns { col, row, el } or null if no square was found.
+  Modern chess.com: the user clicks ON a piece div which is a sibling
+  of square divs, not a child. So we just need to find the first ancestor
+  (including the target itself) that looks like a piece element.
 */
-function getSquareFromEl(el) {
-  let node = el;
-
-  // Walk up from the clicked element to (but not past) <chess-board>
+function detectClickedPiece(target) {
+  let node = target;
   while (node && node.tagName !== 'CHESS-BOARD') {
-    // Check every class on this element for the pattern "square-XY"
-    const squareClass = [...node.classList].find(c => /^square-\d\d$/.test(c));
-    if (squareClass) {
-      // squareClass is e.g. "square-34"
-      // Index 7 = first digit after "square-", index 8 = second digit
-      const col = parseInt(squareClass[7], 10);
-      const row = parseInt(squareClass[8], 10);
-      return { col, row, el: node };
-    }
+    if (isPieceElement(node)) return node;
     node = node.parentElement;
   }
-
-  return null;  // clicked outside any square
+  return null;
 }
 
 /*
-  squareHasKnight — returns true if the given square element contains
-                    a knight piece.
+  isPieceElement — returns true if the element looks like a chess piece.
 
-  Chess.com piece elements have class names like:
-    "piece wN"  → white knight
-    "piece bN"  → black knight
+  Chess.com uses several layouts. We accept an element as a piece if ANY
+  of these signals is present:
 
-  We try two strategies to find the piece:
-
-  Strategy A: The piece is a CHILD of the square div.
-    squareEl.querySelector('.wN, .bN')
-
-  Strategy B: Chess.com sometimes puts the square class on the piece
-    element itself. In that case the piece and square are the SAME element.
-    We check squareEl itself for the knight class.
-
-  Shadow DOM note:
-    If chess.com uses an open shadow root, we also try shadowRoot.
-    A closed shadow root cannot be accessed from a content script at all —
-    if that's the case, we log a clear error rather than failing silently.
+  1. Has class "piece" (base class present in most chess.com layouts)
+  2. Has a class matching /^[wb][nbrqk]$/i — colour+type shorthand
+     (e.g. "wn" = white knight, "bb" = black bishop)
+  3. Has a data-piece attribute
+  4. Has a background-image (piece sprite) set via inline style
 */
-function squareHasKnight(squareEl) {
-  // Strategy A: piece is a child element
-  const childKnight = squareEl.querySelector('.wN, .bN');
-  if (childKnight) return true;
+function isPieceElement(el) {
+  if (!el.classList) return false;
 
-  // Strategy B: the square element itself is the piece element
-  if (squareEl.classList.contains('wN') || squareEl.classList.contains('bN')) {
-    return true;
-  }
+  // Signal 1: explicit "piece" base class
+  if (el.classList.contains('piece')) return true;
 
-  // Strategy C: open shadow DOM fallback
-  if (squareEl.shadowRoot) {
-    const shadowKnight = squareEl.shadowRoot.querySelector('.wN, .bN');
-    if (shadowKnight) return true;
-  }
+  // Signal 2: colour+type class like "wn", "bR", "wQ"
+  const colorTypeClass = [...el.classList].some(c => /^[wb][nbrqkNBRQK]$/.test(c));
+  if (colorTypeClass) return true;
+
+  // Signal 3: data-piece attribute
+  if (el.hasAttribute('data-piece')) return true;
+
+  // Signal 4: inline background-image (sprite-based pieces)
+  if (el.style && el.style.backgroundImage && el.style.backgroundImage !== 'none') return true;
 
   return false;
 }
 
-// ── BFS knight move computation ───────────────────────────────────────
+/*
+  isKnightPiece — returns true if the piece element is a knight.
+
+  Checks multiple class naming conventions and attributes to be robust
+  across chess.com layout versions.
+*/
+function isKnightPiece(pieceEl) {
+  if (!pieceEl.classList) return false;
+
+  const classes = [...pieceEl.classList];
+
+  // Modern lowercase: "wn", "bn"
+  if (classes.some(c => /^[wb]n$/.test(c))) return true;
+
+  // Legacy uppercase: "wN", "bN"
+  if (classes.some(c => /^[wb]N$/.test(c))) return true;
+
+  // Case-insensitive catch-all: /^[wb]n$/i
+  if (classes.some(c => /^[wb]n$/i.test(c))) return true;
+
+  // data-piece attribute: "wn", "bn", "knight", "white-knight", etc.
+  const dataPiece = pieceEl.getAttribute('data-piece') || '';
+  if (/[wb]n$/i.test(dataPiece) || dataPiece.toLowerCase().includes('knight')) return true;
+
+  // aria-label: "White Knight", "Black Knight"
+  const aria = pieceEl.getAttribute('aria-label') || '';
+  if (aria.toLowerCase().includes('knight')) return true;
+
+  return false;
+}
 
 /*
-  All 8 possible knight moves as [deltaCol, deltaRow] pairs.
-  A knight moves in an "L" shape: 2 squares in one direction,
-  1 square perpendicular (or vice versa).
+  extractSquare — get { col, row } (both 1–8) from a piece element.
+
+  Tries 5 strategies in order, logging each attempt when DEBUG is true.
+  Returns null only if all 5 fail, meaning we need to add another strategy.
 */
+function extractSquare(pieceEl) {
+  const classes = [...pieceEl.classList];
+
+  // ── Strategy 1: class "square-XY" on the piece element itself ────
+  // Modern chess.com puts the square class directly on the piece div.
+  // e.g. class="piece wn square-26"  → col=2, row=6
+  const squareCls = classes.find(c => /^square-\d\d$/.test(c));
+  if (squareCls) {
+    const col = parseInt(squareCls[7], 10);
+    const row = parseInt(squareCls[8], 10);
+    if (DEBUG) console.log(`[KM] extractSquare strategy 1 (class square-XY): col=${col} row=${row}`);
+    return { col, row };
+  }
+  if (DEBUG) console.log('[KM] extractSquare strategy 1: no match');
+
+  // ── Strategy 2: data-square attribute, numeric ("44") ─────────────
+  // Some layouts use data-square="44" (col=4, row=4 = d4)
+  const dsAttr = pieceEl.getAttribute('data-square');
+  if (dsAttr && /^\d\d$/.test(dsAttr)) {
+    const col = parseInt(dsAttr[0], 10);
+    const row = parseInt(dsAttr[1], 10);
+    if (DEBUG) console.log(`[KM] extractSquare strategy 2 (data-square numeric): col=${col} row=${row}`);
+    return { col, row };
+  }
+  if (DEBUG && !dsAttr) console.log('[KM] extractSquare strategy 2: no data-square attr');
+
+  // ── Strategy 3: data-square attribute, algebraic ("d4") ───────────
+  // Some layouts use data-square="d4" (standard algebraic notation)
+  if (dsAttr && /^[a-h][1-8]$/i.test(dsAttr)) {
+    const col = 'abcdefgh'.indexOf(dsAttr[0].toLowerCase()) + 1;
+    const row = parseInt(dsAttr[1], 10);
+    if (DEBUG) console.log(`[KM] extractSquare strategy 3 (data-square algebraic): col=${col} row=${row}`);
+    return { col, row };
+  }
+  if (DEBUG && dsAttr) console.log(`[KM] extractSquare strategy 2+3: data-square="${dsAttr}" did not match`);
+
+  // ── Strategy 4: CSS transform — pixel position on the board ───────
+  // Fallback for layouts that position pieces by CSS transform only.
+  // Parses the transform matrix and divides by square size.
+  if (STATE.boardEl) {
+    const boardRect  = STATE.boardEl.getBoundingClientRect();
+    const squareSize = boardRect.width / 8;
+    const style      = window.getComputedStyle(pieceEl);
+    const matrix     = style.transform || style.webkitTransform;
+
+    if (matrix && matrix !== 'none') {
+      // matrix(a, b, c, d, tx, ty)
+      const match = matrix.match(/matrix\([^,]+,[^,]+,[^,]+,[^,]+,([^,]+),([^)]+)\)/);
+      if (match) {
+        const tx = parseFloat(match[1]);
+        const ty = parseFloat(match[2]);
+        const col = Math.round(tx / squareSize) + 1;
+        const row = 8 - Math.round(ty / squareSize);
+        if (col >= 1 && col <= 8 && row >= 1 && row <= 8) {
+          if (DEBUG) console.log(`[KM] extractSquare strategy 4 (transform pixel): col=${col} row=${row}`);
+          return { col, row };
+        }
+      }
+    }
+  }
+  if (DEBUG) console.log('[KM] extractSquare strategy 4: no usable transform');
+
+  // ── Strategy 5: walk upward to find a square ancestor ─────────────
+  // Defensive coverage for layouts where pieces ARE nested in squares.
+  let node = pieceEl.parentElement;
+  while (node && node.tagName !== 'CHESS-BOARD') {
+    const cls = [...(node.classList || [])].find(c => /^square-\d\d$/.test(c));
+    if (cls) {
+      const col = parseInt(cls[7], 10);
+      const row = parseInt(cls[8], 10);
+      if (DEBUG) console.log(`[KM] extractSquare strategy 5 (ancestor square class): col=${col} row=${row}`);
+      return { col, row };
+    }
+    node = node.parentElement;
+  }
+  if (DEBUG) console.log('[KM] extractSquare strategy 5: no square ancestor found');
+
+  return null;  // all strategies exhausted
+}
+
+// ── BFS knight move computation ───────────────────────────────────────
+
 const KNIGHT_MOVES = [
   [-2, -1], [-2, +1],
   [-1, -2], [-1, +2],
@@ -242,171 +392,90 @@ const KNIGHT_MOVES = [
 ];
 
 /*
-  bfs — Breadth-First Search for knight reachability
+  bfs — returns all squares reachable from (startCol, startRow) within
+  maxDepth knight moves, filtered by mode.
 
-  Parameters:
-    startCol, startRow  — starting position (1–8)
-    maxDepth            — maximum number of knight moves
-    mode                — 'within' or 'exact'
+  firstReached tracks the SHORTEST path depth to each square.
 
-  Returns an array of objects { col, row, depth } for each reachable
-  square, filtered by mode.
-
-  How BFS works here:
-  ───────────────────
-  We maintain a queue of positions to explore. Each entry records
-  the position (col, row) and the number of moves taken to reach it (d).
-
-  We also maintain a Map from "col,row" → first depth at which we
-  reached that square. This prevents us from visiting the same square
-  twice (which would cause infinite loops) and tells us the SHORTEST
-  path length to each square.
-
-  Mode semantics:
-  ───────────────
-  'within N':  collect all squares whose shortest path ≤ N moves.
-  'exact N':   collect only squares whose shortest path = exactly N moves.
-               Note: a square reachable in 2 moves is NOT in "exactly 3"
-               results, even if there's a longer 3-move path. This is
-               the BFS shortest-path interpretation, which is most
-               useful for "how many moves minimum does the knight need."
+  'within':  collect squares where shortest path ≤ maxDepth
+  'exact':   collect squares where shortest path = maxDepth exactly
+             (a square reachable in 2 moves won't appear in "exactly 3")
 */
 function bfs(startCol, startRow, maxDepth, mode) {
-  // Map from "col,row" string key → depth at first visit
   const firstReached = new Map();
-
-  // Queue: each entry is { col, row, d } where d = depth (moves so far)
   const queue = [{ col: startCol, row: startRow, d: 0 }];
   firstReached.set(`${startCol},${startRow}`, 0);
 
   while (queue.length > 0) {
-    const { col, row, d } = queue.shift();  // dequeue from front (BFS)
-
-    // Don't expand beyond the maximum depth
+    const { col, row, d } = queue.shift();
     if (d >= maxDepth) continue;
 
     for (const [dc, dr] of KNIGHT_MOVES) {
-      const nc = col + dc;  // new column
-      const nr = row + dr;  // new row
-
-      // Bounds check: board is 1–8 in both dimensions
+      const nc = col + dc, nr = row + dr;
       if (nc < 1 || nc > 8 || nr < 1 || nr > 8) continue;
-
       const key = `${nc},${nr}`;
-      if (firstReached.has(key)) continue;  // already visited — skip
-
+      if (firstReached.has(key)) continue;
       firstReached.set(key, d + 1);
       queue.push({ col: nc, row: nr, d: d + 1 });
     }
   }
 
-  // Build the result array, excluding the start square and filtering by mode
   const result = [];
   for (const [key, depth] of firstReached) {
-    if (depth === 0) continue;  // skip the start square itself
-
+    if (depth === 0) continue;
     const [c, r] = key.split(',').map(Number);
-
-    if (mode === 'within' && depth <= maxDepth) {
-      result.push({ col: c, row: r, depth });
-    } else if (mode === 'exact' && depth === maxDepth) {
-      result.push({ col: c, row: r, depth });
-    }
+    if (mode === 'within' && depth <= maxDepth) result.push({ col: c, row: r, depth });
+    else if (mode === 'exact'  && depth === maxDepth) result.push({ col: c, row: r, depth });
   }
-
   return result;
 }
 
 // ── Overlay rendering ─────────────────────────────────────────────────
 
 /*
-  renderOverlays — draw circle dots on all reachable squares.
+  renderOverlays — appends a fixed-position container to document.body
+  (never modifies chess.com's own DOM) and places circle dots on each
+  reachable square.
 
-  Approach:
-    We create a single "container" div and append it to document.body.
-    The container is sized and positioned to exactly cover the board
-    using position:fixed + the board's getBoundingClientRect().
+  The container is anchored to the board via getBoundingClientRect()
+  and reanchored on scroll/resize.
 
-    Inside the container, each reachable square gets a .km-circle div
-    positioned as a percentage (so it scales with the board size).
-
-    Why position:fixed anchored to board rect instead of appending
-    inside <chess-board>?
-    ──────────────────────────────────────────────────────────────────
-    Appending inside <chess-board> risks breaking chess.com's internal
-    event handling or layout. Using a fixed-position overlay on
-    document.body is non-invasive: we never modify chess.com's DOM.
-
-    Why scroll/resize listeners?
-    ──────────────────────────────────────────────────────────────────
-    position:fixed is relative to the VIEWPORT, not the document.
-    If the page scrolls or the window resizes, the board moves but
-    our fixed container doesn't — we must recompute its position.
+  Board flip is detected empirically: if square-11 (a1) is visually
+  in the right half of the board, we're viewing it from Black's side.
 */
 function renderOverlays(squares) {
   if (!STATE.boardEl || squares.length === 0) return;
 
-  // Create the container div
   const container = document.createElement('div');
   container.className = 'km-overlay-container';
   document.body.appendChild(container);
   STATE.overlayContainer = container;
 
-  // Position container to cover the board
   positionContainer(container);
 
-  // Determine board orientation (flipped = playing as Black)
   const flipped = isBoardFlipped();
 
-  // Create one circle div per reachable square
-  for (const { col, row, depth } of squares) {
+  for (const { col, row } of squares) {
     const circle = document.createElement('div');
     circle.className = 'km-circle';
+    if (STATE.mode === 'exact') circle.classList.add('km-exact');
 
-    // Add mode-specific class for colour differentiation (see styles.css)
-    if (STATE.mode === 'exact') {
-      circle.classList.add('km-exact');
-    }
-
-    /*
-      Calculate percentage-based position within the container.
-
-      The board is 8×8. Each square occupies 12.5% of width/height.
-
-      Normal orientation (White at bottom):
-        col 1 (a-file) is at the LEFT   → left = (col - 1) / 8 * 100%
-        row 1 (rank 1) is at the BOTTOM → top  = (8 - row) / 8 * 100%
-
-      Flipped orientation (Black at bottom):
-        col 1 (a-file) is at the RIGHT  → left = (8 - col) / 8 * 100%
-        row 1 (rank 1) is at the TOP    → top  = (row - 1) / 8 * 100%
-    */
-    let leftPct, topPct;
-    if (flipped) {
-      leftPct = (8 - col) / 8 * 100;
-      topPct  = (row - 1) / 8 * 100;
-    } else {
-      leftPct = (col - 1) / 8 * 100;
-      topPct  = (8 - row) / 8 * 100;
-    }
-
+    // Normal  (White at bottom): left = (col-1)/8,  top = (8-row)/8
+    // Flipped (Black at bottom): left = (8-col)/8,  top = (row-1)/8
+    const leftPct = flipped ? (8 - col) / 8 * 100 : (col - 1) / 8 * 100;
+    const topPct  = flipped ? (row - 1) / 8 * 100 : (8 - row) / 8 * 100;
     circle.style.left = leftPct + '%';
     circle.style.top  = topPct  + '%';
 
     container.appendChild(circle);
   }
 
-  // Re-anchor the container when the page scrolls or the window resizes
   STATE._scrollListener = () => positionContainer(container);
   STATE._resizeListener  = () => positionContainer(container);
   window.addEventListener('scroll', STATE._scrollListener, { passive: true });
   window.addEventListener('resize', STATE._resizeListener, { passive: true });
 }
 
-/*
-  positionContainer — sync the overlay container's position with the
-                       board's current viewport position.
-*/
 function positionContainer(container) {
   if (!STATE.boardEl) return;
   const rect = STATE.boardEl.getBoundingClientRect();
@@ -417,62 +486,34 @@ function positionContainer(container) {
 }
 
 /*
-  isBoardFlipped — detect whether we're viewing the board from Black's side.
-
-  We don't rely on any specific chess.com CSS class (which could change).
-  Instead we measure: if the square-11 element (a1, bottom-left for White)
-  is visually in the RIGHT half of the board, the board is flipped.
-
-  Returns true if the board is flipped (Black's perspective).
+  isBoardFlipped — empirical detection: if a1 (square-11) is visually
+  in the right half of the board, the board is showing Black's perspective.
 */
 function isBoardFlipped() {
   const sq11 = findSquareEl(1, 1);
-  if (!sq11) return false;  // can't determine — assume not flipped
+  if (!sq11) return false;
 
   const boardRect = STATE.boardEl.getBoundingClientRect();
   const sqRect    = sq11.getBoundingClientRect();
-
-  const sqCenterX    = sqRect.left + sqRect.width / 2;
-  const boardCenterX = boardRect.left + boardRect.width / 2;
-
-  // If a1's visual centre is to the RIGHT of the board centre, it's flipped
-  return sqCenterX > boardCenterX;
+  return (sqRect.left + sqRect.width / 2) > (boardRect.left + boardRect.width / 2);
 }
 
 /*
-  findSquareEl — find the DOM element for a given board coordinate.
-
-  Tries light DOM (normal), then the board element's open shadow root.
-  Logs a descriptive error if neither works (closed shadow DOM, etc.).
+  findSquareEl — locate the DOM element for a given square coordinate.
+  Used by isBoardFlipped(). Tries light DOM, then open shadow root.
 */
 function findSquareEl(col, row) {
   const selector = `.square-${col}${row}`;
-
-  // Attempt 1: normal DOM search from the board element
   let el = STATE.boardEl.querySelector(selector);
   if (el) return el;
-
-  // Attempt 2: open shadow root
   if (STATE.boardEl.shadowRoot) {
     el = STATE.boardEl.shadowRoot.querySelector(selector);
     if (el) return el;
   }
-
-  // Attempt 3: search the full document (some chess.com layouts)
   el = document.querySelector(selector);
-  if (el) return el;
-
-  console.warn(
-    `[Knight Moves] Could not find square element for col=${col} row=${row}.` +
-    ` Chess.com may be using a closed shadow DOM, which cannot be accessed` +
-    ` from a content script.`
-  );
-  return null;
+  return el || null;
 }
 
-/*
-  clearOverlays — remove all overlay circles and clean up listeners.
-*/
 function clearOverlays() {
   if (STATE.overlayContainer) {
     STATE.overlayContainer.remove();
@@ -490,27 +531,12 @@ function clearOverlays() {
 
 // ── Message listener (popup → content script) ─────────────────────────
 
-/*
-  The popup sends a 'SETTINGS_UPDATE' message whenever the user changes
-  the depth slider or mode radio. We update STATE and immediately
-  re-render if a knight is currently selected.
-
-  chrome.runtime.onMessage.addListener(callback)
-  ────────────────────────────────────────────────
-  This is how content scripts receive messages sent via
-  chrome.tabs.sendMessage() from popup.js or the background.
-  The callback receives:
-    msg        — the message object
-    sender     — info about who sent it (tab, extension, etc.)
-    sendResponse — function to send a reply (optional)
-*/
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg.type !== 'SETTINGS_UPDATE') return;
 
   STATE.depth = msg.depth;
   STATE.mode  = msg.mode;
 
-  // If the user has already clicked a knight, re-draw with the new settings
   if (STATE.clickedSquare) {
     const { col, row } = STATE.clickedSquare;
     const reachable = bfs(col, row, STATE.depth, STATE.mode);
@@ -518,6 +544,5 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     renderOverlays(reachable);
   }
 
-  // Acknowledge the message (prevents "message port closed" warnings)
   sendResponse({ ok: true });
 });
